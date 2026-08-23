@@ -1,0 +1,172 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+usage() {
+  echo "Usage: packages-resolve MANIFEST..." >&2
+}
+
+(( $# > 0 )) || { usage; exit 2; }
+
+for tool in pacman curl jq; do
+  command -v "$tool" >/dev/null || die "packages-resolve requires $tool"
+done
+
+# Some packages never come from pacman repositories: release-bundle archives
+# and packages makepkg-built from the omarchy-pkgs checkout during install.
+# Read both sets from the fresh installer to keep a single source of truth.
+installer="$ROOT/bin/omarchy-install-asahi-fresh"
+[[ -r $installer ]] || die "Fresh installer is unavailable: $installer"
+bundle_line=$(sed -n 's/^expected_packages=(\(.*\))$/\1/p' "$installer")
+[[ -n $bundle_line ]] || die "Could not read the release bundle packages from $installer"
+source_names=$(awk '
+  /^source_packages=\(/ {
+    inside = 1
+    sub(/^source_packages=\(/, "")
+  }
+  inside {
+    if (sub(/\).*/, "")) {
+      done = 1
+    }
+    for (i = 1; i <= NF; i++) print $i
+    if (done) exit
+  }
+' "$installer")
+[[ -n $source_names ]] || die "Could not read the source-built packages from $installer"
+
+declare -A provided_packages=()
+for package in $bundle_line $source_names; do
+  provided_packages[$package]=1
+done
+
+# Packages published through the project's own PKGBUILD collection also count
+# as resolved; one directory listing covers every name.
+PKGS_REPO=${OMARCHY_PKGS_REPO:-maralcbr/omarchy-pkgs}
+pkgs_names() {
+  local listing="" attempt auth_args=()
+
+  [[ -n ${GH_TOKEN:-} ]] && auth_args=(-H "Authorization: Bearer $GH_TOKEN")
+  for attempt in 1 2 3; do
+    if listing=$(curl -fsSL --max-time 60 "${auth_args[@]}" \
+      "https://api.github.com/repos/$PKGS_REPO/contents/pkgbuilds" 2>/dev/null |
+      jq -r '.[].name'); then
+      printf '%s\n' "$listing"
+      return 0
+    fi
+    (( attempt < 3 )) && sleep 5
+  done
+  return 1
+}
+
+pkgs_listing=$(pkgs_names) || die "Could not list the $PKGS_REPO pkgbuilds"
+declare -A project_packages=()
+while IFS= read -r name; do
+  if [[ -n $name ]]; then
+    project_packages[$name]=1
+  fi
+done <<<"$pkgs_listing"
+
+# The AUR RPC answers existence queries without cloning anything. Names are
+# batched because large single requests exceed comfortable URL lengths.
+aur_lookup() {
+  local names=("$@")
+  local hits="" start attempt response chunk_args name
+
+  for (( start = 0; start < ${#names[@]}; start += 100 )); do
+    chunk_args=()
+    for name in "${names[@]:$start:100}"; do
+      chunk_args+=(--data-urlencode "arg[]=$name")
+    done
+    response=""
+    for attempt in 1 2 3; do
+      if response=$(curl -fsSL --max-time 60 --get \
+        'https://aur.archlinux.org/rpc/v5/info' "${chunk_args[@]}" 2>/dev/null); then
+        break
+      fi
+      (( attempt < 3 )) && sleep 5
+    done
+    [[ -n $response ]] || return 1
+    [[ $(jq -r '.type' <<<"$response") == "multiinfo" ]] || return 1
+    hits+=$(jq -r '[.results[].Name] | join("\n")' <<<"$response")$'\n'
+  done
+
+  printf '%s' "$hits"
+}
+
+pacman -Sy >/dev/null || die "Could not synchronize package databases"
+
+status=0
+for manifest in "$@"; do
+  [[ -r $manifest ]] || die "Manifest is unreadable: $manifest"
+  malformed=$(awk '{ sub(/#.*/, "") } NF > 1 { print FILENAME ":" FNR ": " $0 }' "$manifest")
+  [[ -z $malformed ]] || die "Manifest lines must hold exactly one package name:"$'\n'"$malformed"
+
+  mapfile -t entries < <(awk '{ sub(/#.*/, ""); if (NF == 1) print $1 }' "$manifest")
+
+  candidates=()
+  provided=0
+  for entry in "${entries[@]}"; do
+    if [[ ${provided_packages[$entry]:-} ]]; then
+      (( provided += 1 ))
+    else
+      candidates+=("$entry")
+    fi
+  done
+
+  misses=()
+  for entry in "${candidates[@]}"; do
+    pacman -Si "$entry" >/dev/null 2>&1 || misses+=("$entry")
+  done
+
+  declare -A project_hits=()
+  aur_candidates=()
+  for miss in "${misses[@]}"; do
+    if [[ ${project_packages[$miss]:-} ]]; then
+      project_hits[$miss]=1
+    else
+      aur_candidates+=("$miss")
+    fi
+  done
+
+  declare -A aur_hits=()
+  if (( ${#aur_candidates[@]} > 0 )); then
+    aur_reply=$(aur_lookup "${aur_candidates[@]}") ||
+      die "The AUR RPC endpoint could not be reached"
+    while IFS= read -r name; do
+      if [[ -n $name ]]; then
+        aur_hits[$name]=1
+      fi
+    done <<<"$aur_reply"
+  fi
+
+  unresolved=()
+  for miss in "${misses[@]}"; do
+    if [[ -z ${project_hits[$miss]:-} && -z ${aur_hits[$miss]:-} ]]; then
+      unresolved+=("$miss")
+    fi
+  done
+
+  repo_count=$((${#candidates[@]} - ${#misses[@]}))
+  printf '%s: %d entries (%d repositories, %d project, %d AUR, %d provided during install, %d unresolved)\n' \
+    "$(basename "$manifest")" \
+    "${#entries[@]}" \
+    "$repo_count" \
+    "${#project_hits[@]}" \
+    "${#aur_hits[@]}" \
+    "$provided" \
+    "${#unresolved[@]}"
+  for unresolved_name in "${unresolved[@]}"; do
+    printf '  missing: %s\n' "$unresolved_name" >&2
+  done
+  (( ${#unresolved[@]} == 0 )) || status=1
+done
+
+(( status == 0 )) || echo "Unresolvable packages were found." >&2
+exit "$status"
