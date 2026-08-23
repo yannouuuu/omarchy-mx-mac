@@ -73,6 +73,20 @@ while IFS= read -r name; do
   fi
 done <<<"$pkgs_listing"
 
+# x86 manifests stay byte-compatible with upstream Omarchy, which publishes a
+# few of their entries through its own infrastructure rather than any public
+# repository or the AUR. They cannot resolve here but must not block this
+# fork's checks, so they only ever fail when reintroduced into an Asahi
+# manifest, which must never carry them.
+declare -A upstream_only_packages=(
+  [nvim]=1
+  [omacalc]=1
+  [ttfx]=1
+  [nvidia-dkms]=1
+  [linux-ptl-headers]=1
+  [yay-debug]=1
+)
+
 # The AUR RPC answers existence queries without cloning anything. Names are
 # batched because large single requests exceed comfortable URL lengths.
 aur_lookup() {
@@ -112,9 +126,13 @@ for manifest in "$@"; do
 
   candidates=()
   provided=0
+  upstream=0
+  pc_manifest=$(basename "$manifest")
   for entry in "${entries[@]}"; do
     if [[ ${provided_packages[$entry]:-} ]]; then
       (( provided += 1 ))
+    elif [[ $pc_manifest != *-asahi.packages && ${upstream_only_packages[$entry]:-} ]]; then
+      (( upstream += 1 ))
     else
       candidates+=("$entry")
     fi
@@ -154,13 +172,14 @@ for manifest in "$@"; do
   done
 
   repo_count=$((${#candidates[@]} - ${#misses[@]}))
-  printf '%s: %d entries (%d repositories, %d project, %d AUR, %d provided during install, %d unresolved)\n' \
-    "$(basename "$manifest")" \
+  printf '%s: %d entries (%d repositories, %d project, %d AUR, %d provided during install, %d upstream-only, %d unresolved)\n' \
+    "$pc_manifest" \
     "${#entries[@]}" \
     "$repo_count" \
     "${#project_hits[@]}" \
     "${#aur_hits[@]}" \
     "$provided" \
+    "$upstream" \
     "${#unresolved[@]}"
   for unresolved_name in "${unresolved[@]}"; do
     printf '  missing: %s\n' "$unresolved_name" >&2

@@ -120,10 +120,10 @@ jobs:
             -v "$PWD:/repo:ro" \
             alarm:aarch64 /bin/bash -c "pacman -Sy --noconfirm jq >/dev/null && /repo/test/packages-resolve /repo/install/${{ matrix.manifest }}"
 
-  # Each Asahi manifest installs in its own fresh root filesystem: the lists
-  # deliberately contain alternatives such as yay versus yay-debug that must
-  # not share a transaction. This proves today's dependency closure resolves
-  # and installs, mirroring the fresh installer's single pacman transaction.
+  # Each Asahi manifest installs in its own fresh root filesystem so every
+  # list stays independently co-installable. This proves today's dependency
+  # closure resolves and installs, mirroring the fresh installer's single
+  # pacman transaction.
   install-asahi:
     name: Install ${{ matrix.manifest }} transaction
     strategy:
