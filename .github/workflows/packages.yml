@@ -165,7 +165,15 @@ jobs:
           EOF
       - name: Install every manifest package
         run: |
+          # ALARM split the Mesa Vulkan drivers into standalone packages while
+          # asahi-alarm's mesa still bundles Turnip, so installing the split
+          # vulkan-asahi next to it fails on shared files. Runtime code already
+          # guards on this (omarchy-upgrade-to-quattro installs vulkan-asahi
+          # only when /usr/lib/libvulkan_asahi.so is absent). Skip the entry
+          # until asahi-alarm rebases; its dependency
+          # vulkan-mesa-implicit-layers then leaves the closure with it.
           docker run --rm \
+            -e OMARCHY_TRANSACTION_IGNORE=vulkan-asahi \
             -v "$RUNNER_TEMP/pacman.conf:/etc/pacman.conf:ro" \
             -v "$PWD:/repo:ro" \
             alarm:aarch64 /bin/bash /repo/test/packages-install-transaction "/repo/install/${{ matrix.manifest }}"

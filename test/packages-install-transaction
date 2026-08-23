@@ -44,8 +44,17 @@ for package in $bundle_line $source_names; do
   excluded_packages[$package]=1
 done
 
+# OMARCHY_TRANSACTION_IGNORE lists manifest entries a platform must skip for
+# now, mirroring the fresh installer's --ignore handling. The active list and
+# its reason live beside the invocation in the workflow.
+declare -A ignored_packages=()
+for package in ${OMARCHY_TRANSACTION_IGNORE:-}; do
+  ignored_packages[$package]=1
+done
+
 declare -A seen=()
 packages=()
+ignored=0
 for manifest in "$@"; do
   [[ -r $manifest ]] || die "Manifest is unreadable: $manifest"
   malformed=$(awk '{ sub(/#.*/, "") } NF > 1 { print FILENAME ":" FNR ": " $0 }' "$manifest")
@@ -55,7 +64,11 @@ for manifest in "$@"; do
     [[ ${excluded_packages[$entry]:-} ]] && continue
     [[ ${seen[$entry]:-} ]] && continue
     seen[$entry]=1
-    packages+=("$entry")
+    if [[ ${ignored_packages[$entry]:-} ]]; then
+      (( ignored += 1 ))
+    else
+      packages+=("$entry")
+    fi
   done < <(awk '{ sub(/#.*/, ""); if (NF == 1) print $1 }' "$manifest")
 done
 
@@ -70,5 +83,5 @@ if pacman -Qi linux-aarch64 >/dev/null 2>&1; then
   pacman -Rns --noconfirm linux-aarch64
 fi
 
-echo "Installing ${#packages[@]} packages in a single transaction"
+echo "Installing ${#packages[@]} packages in a single transaction ($ignored ignored)"
 exec pacman -Syu --needed --noconfirm "${packages[@]}"
